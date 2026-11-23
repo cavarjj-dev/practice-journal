@@ -8,13 +8,14 @@
   const PROVIDERS = {
     anthropic: {
       name: 'Anthropic (Claude)', origin: 'https://api.anthropic.com', model: 'claude-haiku-5-5',
+      models: [{ id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 (fast, cheapest, default)' }, { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (stronger, pricier)' }],
       keyUrl: 'https://console.anthropic.com/settings/keys', keyHint: 'starts with sk-ant-',
       async call(cfg, system, user) {
-        const r = await fetch('https://api.anthropic.com/v1/messages', {
+        const r = await timedFetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-api-key': cfg.key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
           body: JSON.stringify({ model: cfg.model, max_tokens: 900, system, messages: [{ role: 'user', content: user }] }),
-        });
+        }, 60000);
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error((j.error && j.error.message) || 'HTTP ' + r.status);
         return (j.content || []).map((c) => c.text || '').join('');
@@ -22,33 +23,94 @@
     },
     openai: {
       name: 'OpenAI', origin: 'https://api.openai.com', model: 'gpt-5.4-mini',
+      models: [{ id: 'gpt-5.4-mini', label: 'GPT-5.4 mini (fast, default)' }, { id: 'gpt-5.2', label: 'GPT-5.2 (stronger, pricier)' }],
       keyUrl: 'https://platform.openai.com/api-keys', keyHint: 'starts with sk-',
-      async call(cfg, system, user) {
-        const r = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + cfg.key },
-          body: JSON.stringify({ model: cfg.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], response_format: { type: 'json_object' } }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error((j.error && j.error.message) || 'HTTP ' + r.status);
-        return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
-      },
+      call: (cfg, system, user) => openaiCompatible('https://api.openai.com/v1/chat/completions', cfg, system, user),
+    },
+    xai: {
+      name: 'xAI (Grok)', origin: 'https://api.x.ai', model: 'grok-4.20-non-reasoning',
+      models: [{ id: 'grok-4.20-non-reasoning', label: 'Grok 4.20 non-reasoning (fast, default)' }, { id: 'grok-4.3', label: 'Grok 4.3 (light reasoning)' }, { id: 'grok-4.7', label: 'Grok 4.7 (strongest, slower, pricier)' }],
+      keyUrl: 'https://console.x.ai', keyHint: 'starts with xai-',
+      call: (cfg, system, user) => openaiCompatible('https://api.x.ai/v1/chat/completions', cfg, system, user),
+    },
+    custom: {
+      name: 'Local / custom server', origin: '', model: '', models: [], keyHint: 'optional',
+      // qwen3-style models think out loud unless told not to; /no_think is Qwen's soft switch. <think> blocks are also stripped.
+      call: (cfg, system, user) => openaiCompatible(cfg.base + '/chat/completions', cfg, system, /qwen3/i.test(cfg.model) ? user + '\n/no_think' : user),
     },
   };
-  const DEFAULT_AI = { provider: 'anthropic', model: '', key: '' };
-  const DEFAULT_VOICE = { speak: true, rate: 1, autoSend: true, pauseSec: 4, lang: '' };
-  async function getAI() { return Object.assign({}, DEFAULT_AI, await metaGet('ai', {})); }
-  async function getVoice() { return Object.assign({}, DEFAULT_VOICE, await metaGet('voice', {})); }
-  function parseJSON(text) {
-    const m = String(text || '').match(/\{[\s\S]*\}/);
-    if (!m) throw new Error('The AI reply wasn’t readable.');
-    return JSON.parse(m[0]);
+  // Ollama and LM Studio serve the OpenAI-compatible API under /v1; add it when the URL has no path.
+  function normalizeBase(base) {
+    base = String(base || '').trim().replace(/\/+$/, '');
+    try { const u = new URL(base); if (u.pathname === '/' || u.pathname === '') return u.origin + '/v1'; } catch (e) { /* validated elsewhere */ }
+    return base;
   }
-  async function askAI(system, user) {
+  function timedFetch(url, opts, ms) {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms);
+    return fetch(url, Object.assign({}, opts, { signal: ctl.signal })).catch((e) => { throw e.name === 'AbortError' ? new Error('No reply after ' + Math.round(ms / 1000) + ' seconds.') : e; }).finally(() => clearTimeout(t));
+  }
+  function baseOrigin(base) {
+    let u; try { u = new URL(base); } catch (e) { throw new Error('That isn’t a full URL. Example: https://my-pc.tailnet-name.ts.net/v1'); }
+    const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname);
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && local)) throw new Error('This page is https, so the server must be https too (http works only for localhost on the same computer).');
+    return u.origin;
+  }
+  async function openaiCompatible(url, cfg, system, user) {
+    const body = { model: cfg.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], response_format: { type: 'json_object' } };
+    const headers = { 'content-type': 'application/json' }; if (cfg.key) headers.authorization = 'Bearer ' + cfg.key;
+    // Local models can take 30-60 s on first load, so allow much longer for a custom server.
+    const send = (b) => timedFetch(url, { method: 'POST', headers, body: JSON.stringify(b) }, cfg.base ? 180000 : 60000);
+    let r = await send(body); let j = await r.json().catch(() => ({}));
+    // Some servers/models (LM Studio, older Ollama models) reject JSON mode: retry once without it.
+    if (!r.ok && (r.status === 400 || r.status === 422 || (cfg.base && r.status >= 400 && r.status < 500 && r.status !== 401 && r.status !== 403 && r.status !== 404))) { delete body.response_format; r = await send(body); j = await r.json().catch(() => ({})); }
+    if (!r.ok) throw new Error((j.error && (j.error.message || j.error)) || j.message || 'HTTP ' + r.status);
+    return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+  }
+
+  const DEFAULT_VOICE = { speak: true, rate: 1, autoSend: true, pauseSec: 4, lang: '' };
+  // Stored as { provider, keys: {anthropic, openai, xai}, models: {...} }; one key per provider, kept on this device only.
+  async function getAI() {
+    const raw = await metaGet('ai', {}) || {};
+    const provider = PROVIDERS[raw.provider] ? raw.provider : 'anthropic';
+    const keys = Object.assign({}, raw.keys); const models = Object.assign({}, raw.models);
+    if (raw.key && !keys[provider]) keys[provider] = raw.key; // migrate v3 format
+    if (raw.model && !models[provider]) models[provider] = raw.model;
+    const custom = Object.assign({ base: '', models: [] }, raw.custom);
+    return { provider, keys, models, custom, key: keys[provider] || '', model: models[provider] || '' };
+  }
+  const saveAI = (ai) => metaSet('ai', { provider: ai.provider, keys: ai.keys, models: ai.models, custom: ai.custom });
+  function syncPolicy(ai) { // csp.js reads these on the next load
+    let changed = false;
+    try {
+      const want = ai.provider; const wantOrigin = ai.provider === 'custom' && ai.custom.base ? baseOrigin(ai.custom.base) : '';
+      if ((localStorage.getItem('pj-provider') || 'anthropic') !== want) { localStorage.setItem('pj-provider', want); changed = true; }
+      if ((localStorage.getItem('pj-custom-origin') || '') !== wantOrigin) { localStorage.setItem('pj-custom-origin', wantOrigin); changed = changed || want === 'custom'; }
+    } catch (e) { /* */ }
+    return changed;
+  }
+  function reloadToSettings() { try { sessionStorage.setItem('pj-view', 'settings'); } catch (e) { /* */ } location.reload(); }
+  async function getVoice() { return Object.assign({}, DEFAULT_VOICE, await metaGet('voice', {})); }
+  function cleanReply(text) {
+    return String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```(?:json)?/gi, '').trim();
+  }
+  function parseJSON(text) {
+    const t = cleanReply(text);
+    const start = t.indexOf('{');
+    if (start < 0) throw new Error('The AI reply wasn’t readable.');
+    // try the longest balanced-looking object first, then shorter ones
+    for (let end = t.lastIndexOf('}'); end > start; end = t.lastIndexOf('}', end - 1)) {
+      try { return JSON.parse(t.slice(start, end + 1)); } catch (e) { /* keep trying */ }
+    }
+    throw new Error('The AI reply wasn’t readable.');
+  }
+  const configured = (ai) => ai.provider === 'custom' ? !!(ai.custom.base && ai.model) : !!ai.key;
+  // fallback(text) is used when a model answers without valid JSON (common with small local models).
+  async function askAI(system, user, fallback) {
     const cfg = await getAI();
     const p = PROVIDERS[cfg.provider] || PROVIDERS.anthropic;
-    if (!cfg.key) return null;
-    return parseJSON(await p.call({ key: cfg.key, model: cfg.model || p.model }, system, user));
+    if (!configured(cfg)) return null;
+    const raw = await p.call({ key: cfg.key, model: cfg.model || p.model, base: cfg.custom.base }, system, user);
+    try { return parseJSON(raw); } catch (e) { if (fallback) return fallback(cleanReply(raw)); throw e; }
   }
 
   const SYSTEM = `You are the scribe and interviewer for Julian's active imagination practice journal (C. G. Jung's method). You fill in one field of his session template at a time from what he says out loud.
@@ -146,7 +208,7 @@ Reply with JSON only: {"action":"fill"|"followup"|"pause"|"skip","value":<entry>
   // ---------- flow ----------
   async function start(mode, fromId) {
     if (S.rec && S.rec.state !== 'idle') { await stopActiveRecording(); toast('Audio recording stopped and saved. Guided mode uses the microphone for talking.'); }
-    G.voice = await getVoice(); G.hasKey = !!(await getAI()).key;
+    G.voice = await getVoice(); { const ai = await getAI(); G.hasKey = configured(ai); G.local = ai.provider === 'custom'; }
     G.mode = mode; G.idx = 0; G.reviewing = false; G.paused = false; G.gaps = []; G.error = ''; G.tip = ''; G.srBroken = false; G.returnToReview = false;
     if (mode === 'session') {
       const s = { id: uid(), status: 'in-progress', guided: true, createdAt: Date.now(), startedAt: Date.now(), step: 0, before: {}, after: {}, clips: [], stopSignals: [], closeChecks: [] };
@@ -216,7 +278,7 @@ Reply with JSON only: {"action":"fill"|"followup"|"pause"|"skip","value":<entry>
     let r;
     if (!G.hasKey) r = localFill(f, text);
     else {
-      try { r = await askAI(SYSTEM + (f.type === 'append' ? '\n' + DIALOGUE_RULE : ''), fieldPrompt(f)); }
+      try { r = await askAI(SYSTEM + (f.type === 'append' ? '\n' + DIALOGUE_RULE : ''), fieldPrompt(f), (txt) => (f.type === 'text' || f.type === 'append') && txt && txt.length < 2000 ? { action: 'fill', value: txt } : localFill(f, text)); }
       catch (e) { G.state = 'idle'; G.error = 'AI request failed: ' + e.message; G.lastText = text; status(); errPaint(); return; }
     }
     G.state = 'idle'; status();
@@ -309,7 +371,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     let say = '';
     if (G.hasKey) {
       try {
-        const r = await askAI(`You review a completed journal entry for Julian's active imagination practice. Check each required field against what it needs. Flag only real gaps: empty, too vague to be useful, or missing a required part (for example an action without a deadline). Do not judge or interpret content. Do not flag optional fields. Reply with JSON only: {"gaps":[{"key":"<field key>","issue":"<under 15 words>"}],"say":"<one short spoken sentence>"}`, JSON.stringify(values));
+        const r = await askAI(`You review a completed journal entry for Julian's active imagination practice. Check each required field against what it needs. Flag only real gaps: empty, too vague to be useful, or missing a required part (for example an action without a deadline). Do not judge or interpret content. Do not flag optional fields. Reply with JSON only: {"gaps":[{"key":"<field key>","issue":"<under 15 words>"}],"say":"<one short spoken sentence>"}`, JSON.stringify(values), () => null);
         if (r && Array.isArray(r.gaps)) { gaps = r.gaps.filter((g) => values.some((v) => v.key === g.key)); say = r.say || ''; }
       } catch (e) { G.error = 'AI review failed (' + e.message + '). Showing basic checks only.'; }
     }
@@ -410,7 +472,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
   function status() {
     const el = $('[data-gstatus]'); const b = $('.talkbtn');
     if (!el) return;
-    const map = { listening: '● Listening… pause or tap Talk to finish', thinking: 'Writing it up…', speaking: 'Speaking…', idle: G.srBroken ? 'Type or use the keyboard mic, then tap Send.' : 'Tap Talk to answer.' };
+    const map = { listening: '● Listening… pause or tap Talk to finish', thinking: G.local ? 'Writing it up… (a local model can take up to a minute the first time)' : 'Writing it up…', speaking: 'Speaking…', idle: G.srBroken ? 'Type or use the keyboard mic, then tap Send.' : 'Tap Talk to answer.' };
     el.textContent = map[G.state] || '';
     if (b) { b.classList.toggle('recording', G.state === 'listening'); b.textContent = G.state === 'listening' ? 'Done' : 'Talk'; b.disabled = G.state === 'thinking'; }
   }
@@ -429,11 +491,17 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     <div class="card"><div class="steplabel">AI for guided sessions</div>
       <label class="field" for="aiProv">Provider</label>
       <div class="chips">${Object.entries(PROVIDERS).map(([k, x]) => `<button class="chip" data-prov="${k}" aria-pressed="${ai.provider === k}">${esc(x.name)}</button>`).join('')}</div>
-      <label class="field" for="aiModel">Model</label>
-      <input type="text" id="aiModel" value="${esc(ai.model)}" placeholder="${esc(p.model)} (default)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      ${ai.provider === 'custom' ? `<label class="field" for="aiBase">Server base URL</label>
+      <input type="url" id="aiBase" value="${esc(ai.custom.base)}" placeholder="https://my-pc.tailnet-name.ts.net/v1" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div class="note small">This page is https, so your server must be https too, and it must allow this site in CORS. Example: Ollama behind Tailscale Serve (<code>tailscale serve --bg 11434</code>) with <code>OLLAMA_ORIGINS=https://cavarjj-dev.github.io</code>; enter <code>https://your-pc.your-tailnet.ts.net</code> (the app adds <code>/v1</code>). LM Studio works the same way (port 1234, enable CORS). <code>http://localhost:11434/v1</code> only works in a browser on that same computer. Text then goes only to your machine.</div>
+      <div class="row mt8"><button class="btn quiet" data-s="load-models">Load models</button></div>` : ''}
+      <label class="field" for="aiModelSel">Model</label>
+      ${(() => { const list = ai.provider === 'custom' ? ai.custom.models.map((id) => ({ id, label: id })) : p.models; const cur = ai.model || p.model; const known = !!cur && list.some((m) => m.id === cur); return `<select id="aiModelSel" class="select">${list.map((m) => `<option value="${esc(m.id)}" ${m.id === cur ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}<option value="__custom" ${known ? '' : 'selected'}>Custom model name…</option></select>
+      <input type="text" id="aiModel" class="${known ? 'hidden' : ''} mt8" value="${known ? '' : esc(cur)}" placeholder="Exact model name from the provider" autocomplete="off" autocapitalize="off" spellcheck="false">`; })()}
       <label class="field" for="aiKey">API key</label>
       <input type="password" id="aiKey" value="" placeholder="${ai.key ? 'Key saved on this device (•••• ' + esc(ai.key.slice(-4)) + ')' : 'Paste your key (' + esc(p.keyHint) + ')'}" autocomplete="off" autocapitalize="off" spellcheck="false">
-      <p class="muted small">Get a key at <a href="${p.keyUrl}" target="_blank" rel="noopener noreferrer">${esc(p.keyUrl.replace('https://', ''))}</a>.</p>
+      <p class="muted small">Keys are saved per provider${Object.keys(PROVIDERS).filter((k) => ai.keys[k]).length ? ' (saved: ' + esc(Object.keys(PROVIDERS).filter((k) => ai.keys[k]).map((k) => PROVIDERS[k].name).join(', ')) + ')' : ''}, so switching doesn’t erase the others.${ai.provider === 'xai' ? ' A Grok or SuperGrok app subscription doesn’t include API credits; API usage is billed separately in the xAI console.' : ''}</p>
+      ${p.keyUrl ? `<p class="muted small">Get a key at <a href="${p.keyUrl}" target="_blank" rel="noopener noreferrer">${esc(p.keyUrl.replace('https://', ''))}</a>.</p>` : '<p class="muted small">Key is optional; leave it empty unless your server requires one.</p>'}
       <div class="row"><button class="btn" data-s="save-ai">Save</button><button class="btn ghost" data-s="test-ai">Test connection</button>${ai.key ? '<button class="btn danger" data-s="clear-ai">Remove key</button>' : ''}</div>
       <p class="small" data-aistatus></p>
     </div>
@@ -443,7 +511,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
         <li><strong>What never leaves:</strong> audio recordings, your history, and your backups stay on this device.</li>
         <li><strong>Speech-to-text:</strong> on iPhone, listening uses Apple’s speech recognition, which may process audio on the device or on Apple’s servers. Keyboard dictation works the same way.</li>
         <li><strong>Your key</strong> is stored only in this browser on this device and is not included in exports. Anyone with this unlocked phone could use it, so set a spending limit with the provider.</li>
-        <li>The provider’s API data policy applies; both OpenAI and Anthropic say API data isn’t used for training by default.</li>
+        <li>The provider’s own API data policy applies. Check it in their console; OpenAI and Anthropic say API data isn’t used for training by default.</li>
       </ul></div>
     <div class="card"><div class="steplabel">Voice</div>
       <div class="checklist">
@@ -458,27 +526,52 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     </div>
     <div class="card"><div class="steplabel">About</div><p class="small muted">Version ${APP_VERSION}. If you don’t see a new feature, close the Home Screen app completely (swipe it away in the app switcher) and open it again.</p></div>`;
   }
+  function chosenModel() {
+    const sel = $('#aiModelSel'); if (!sel) return '';
+    return sel.value === '__custom' ? $('#aiModel').value.trim() : sel.value;
+  }
   async function settingsClick(a) {
     const st = $('[data-aistatus]');
+    if (a === 'load-models') {
+      const ai = await getAI(); const base = normalizeBase($('#aiBase').value);
+      if (base !== ai.custom.base) { st.textContent = 'Tap Save first to apply the new server address, then Load models.'; return; }
+      if (!base) { st.textContent = 'Enter the server URL and tap Save first.'; return; }
+      st.textContent = 'Loading models…';
+      try {
+        const key = $('#aiKey').value.trim() || ai.keys.custom || ''; const headers = key ? { authorization: 'Bearer ' + key } : {};
+        const r = await timedFetch(base + '/models', { headers }, 30000); const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error((j.error && (j.error.message || j.error)) || 'HTTP ' + r.status);
+        const ids = (j.data || j.models || []).map((m) => m.id || m.name || m.model).filter(Boolean);
+        if (!ids.length) throw new Error('The server returned no models.');
+        ai.custom.models = ids; if (!ai.models.custom || !ids.includes(ai.models.custom)) ai.models.custom = ids[0];
+        if (key) ai.keys.custom = key;
+        await saveAI(ai); await render(); $('[data-aistatus]').textContent = `Loaded ${ids.length} model${ids.length > 1 ? 's' : ''}.`;
+      } catch (e) { st.textContent = 'Couldn’t load models: ' + (e.message === 'Failed to fetch' || e.name === 'TypeError' ? 'the server didn’t answer, isn’t https, or doesn’t allow this site (CORS).' : e.message); }
+      return;
+    }
     if (a === 'save-ai') {
       const ai = await getAI(); const key = $('#aiKey').value.trim();
-      ai.model = $('#aiModel').value.trim(); if (key) ai.key = key;
-      await metaSet('ai', ai); toast('Saved on this device.'); render();
+      ai.models[ai.provider] = chosenModel(); if (key) ai.keys[ai.provider] = key;
+      if (ai.provider === 'custom') { const base = normalizeBase($('#aiBase').value); if (base) { try { baseOrigin(base); } catch (e) { st.textContent = e.message; return; } } ai.custom.base = base; }
+      await saveAI(ai); toast('Saved on this device.');
+      if (syncPolicy(ai)) return reloadToSettings();
+      render();
     } else if (a === 'clear-ai') {
-      if (confirm('Remove the API key from this device?')) { const ai = await getAI(); ai.key = ''; await metaSet('ai', ai); render(); }
+      if (confirm('Remove the ' + PROVIDERS[(await getAI()).provider].name + ' key from this device?')) { const ai = await getAI(); delete ai.keys[ai.provider]; await saveAI(ai); render(); }
     } else if (a === 'test-ai') {
       const key = $('#aiKey').value.trim(); const ai = await getAI();
-      if (key) { ai.key = key; ai.model = $('#aiModel').value.trim(); await metaSet('ai', ai); }
-      if (!ai.key) { st.textContent = 'Add a key first.'; return; }
-      st.textContent = 'Testing…';
-      try { const r = await askAI('Reply with JSON only.', 'Return {"ok":true}'); st.textContent = r && r.ok ? 'Connected. The AI is ready.' : 'Connected, but the reply was unexpected.'; }
+      ai.models[ai.provider] = chosenModel(); if (key) ai.keys[ai.provider] = key; await saveAI(ai); ai.key = ai.keys[ai.provider] || '';
+      if (ai.provider === 'custom') { const base = normalizeBase($('#aiBase').value); if (base !== ai.custom.base) { st.textContent = 'Tap Save first to apply the new server address.'; return; } if (!base || !ai.models.custom) { st.textContent = 'Add the server URL and a model, then Save.'; return; } }
+      if (!configured(ai)) { st.textContent = 'Add a key first.'; return; }
+      st.textContent = 'Testing ' + (ai.models[ai.provider] || PROVIDERS[ai.provider].model) + '…' + (ai.provider === 'custom' ? ' A local model can take up to a minute to load the first time.' : '');
+      try { const r = await askAI('Reply with JSON only.', 'Return {"ok":true}', (txt) => ({ ok: !!txt, loose: true })); st.textContent = r && r.ok ? (r.loose ? 'Connected. This model doesn’t reply in strict JSON, so entries may be less tidy; the app will cope.' : 'Connected. The AI is ready.') : 'Connected, but the reply was unexpected.'; }
       catch (e) { st.textContent = 'Didn’t work: ' + e.message; }
     }
   }
 
   // ---------- events ----------
   async function onClick(t) {
-    if (t.dataset.prov) { const ai = await getAI(); if (ai.provider !== t.dataset.prov) { ai.provider = t.dataset.prov; ai.model = ''; ai.key = ''; await metaSet('ai', ai); try { localStorage.setItem('pj-provider', ai.provider); } catch (e) { /* */ } try { sessionStorage.setItem('pj-view', 'settings'); } catch (e) { /* */ } location.reload(); } return true; }
+    if (t.dataset.prov) { const ai = await getAI(); if (ai.provider !== t.dataset.prov) { ai.provider = t.dataset.prov; await saveAI(ai); syncPolicy(ai); reloadToSettings(); } return true; }
     if (t.dataset.s) { await settingsClick(t.dataset.s); return true; }
     if (t.dataset.gv) {
       const grp = t.closest('[data-gscale]'); const v = +t.dataset.gv;
@@ -519,10 +612,13 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
   });
   document.addEventListener('change', async (e) => {
     const el = e.target;
+    if (el.id === 'aiModelSel') { $('#aiModel').classList.toggle('hidden', el.value !== '__custom'); if (el.value === '__custom') $('#aiModel').focus(); }
     if (el.dataset.voice) { const v = await getVoice(); v[el.dataset.voice] = el.checked; await metaSet('voice', v); G.voice = v; }
     if (el.dataset.voicenum) { const v = await getVoice(); const n = parseFloat(el.value); if (n > 0) { v[el.dataset.voicenum] = n; await metaSet('voice', v); G.voice = v; } }
   });
   function leave() { stopListening(true); stopSpeech(); }
 
+  // Keep the connection policy (csp.js reads localStorage) in step with the saved provider.
+  getAI().then((ai) => { if (syncPolicy(ai)) location.reload(); }).catch(() => {});
   window.Guided = { start, view: viewGuided, after: afterGuided, settingsView: viewSettings, onClick, leave, PROVIDERS, _G: G };
 })();
