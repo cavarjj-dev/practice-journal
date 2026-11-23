@@ -1,0 +1,28 @@
+name: Decode binary assets
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['_b64/**']
+permissions:
+  contents: write
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode
+        run: |
+          set -e
+          [ -d _b64 ] || exit 0
+          find _b64 -name '*.b64' | while read f; do
+            t="${f#_b64/}"; t="${t%.b64}"
+            mkdir -p "$(dirname "$t")"
+            base64 -d "$f" > "$t"
+          done
+          git rm -r -q _b64
+          git config user.name "github-actions[bot]"
+          git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Decode icons"
+          git push
