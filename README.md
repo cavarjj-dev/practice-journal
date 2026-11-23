@@ -8,6 +8,11 @@ A private, offline-capable web app for a guided active imagination practice: gro
 - Backups are files you export yourself (.zip with `journal.json` + audio, or text-only .json) and can import again.
 - Clearing the browser's website data deletes the journal. Back up regularly.
 
-**Files**: `index.html`, `styles.css`, `app.js`, `zip.js` (minimal stored-zip writer/reader), `sw.js` (offline cache), `manifest.webmanifest`, `icons/`.
+**Guided session (optional AI)**
+- Speaks each template question (speechSynthesis), listens (Web Speech API, with keyboard-dictation fallback), and can use an AI model to turn spoken answers into concise entries, ask follow-ups, and review for gaps before saving.
+- No server of ours: the user pastes their own API key (Anthropic or OpenAI) in Settings. It is stored only in this browser (IndexedDB) and never exported. Requests go directly from the browser to the chosen provider; `csp.js` narrows `connect-src` to that one provider.
+- Only text is sent to the AI. Audio recordings never leave the device.
+
+**Files**: `index.html`, `styles.css`, `app.js`, `zip.js` (minimal stored-zip writer/reader), `guided.js` (guided session, AI providers, settings), `csp.js` (per-provider connect-src), `sw.js` (offline cache), `manifest.webmanifest`, `icons/`.
 
 This repository contains code only, no personal data. Not indexed (`noindex` + `robots.txt`).
