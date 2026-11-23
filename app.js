@@ -1,6 +1,7 @@
 /* Active Imagination Practice Journal
    Everything stays on this device: IndexedDB for sessions and audio. No network calls. */
 'use strict';
+const APP_VERSION = '3 (Nov 23, 2026)';
 
 // ---------- small helpers ----------
 const $ = (s, r = document) => r.querySelector(s);
@@ -240,7 +241,7 @@ function scale(name, value, labels) {
   return `<div class="scale" role="group" data-scale="${name}">${labels.map((l, i) => `<button type="button" data-v="${i + 1}" aria-pressed="${value === i + 1}"><strong>${i + 1}</strong><span>${esc(l)}</span></button>`).join('')}</div>`;
 }
 function progress(i) { return `<div class="progress" aria-hidden="true">${STEPS.slice(0, -1).map((_, k) => `<span class="${k <= i ? 'done' : ''}"></span>`).join('')}</div>`; }
-function setNav(view) { $$('.tabs button').forEach((b) => b.setAttribute('aria-current', b.dataset.nav === view || (view === 'session' && b.dataset.nav === 'home') || (view === 'detail' && b.dataset.nav === 'history') ? 'page' : 'false')); }
+function setNav(view) { $$('.tabs button').forEach((b) => b.setAttribute('aria-current', b.dataset.nav === view || ((view === 'session' || view === 'guided') && b.dataset.nav === 'home') || (view === 'detail' && b.dataset.nav === 'history') ? 'page' : 'false')); }
 
 // ---------- stats ----------
 function weekKey(t) { const d = new Date(t); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d.getTime(); }
@@ -311,18 +312,22 @@ async function render() {
   else if (S.view === 'detail') app.innerHTML = await viewDetail();
   else if (S.view === 'reflect') app.innerHTML = viewReflect();
   else if (S.view === 'backup') app.innerHTML = await viewBackup();
+  else if (S.view === 'guided') app.innerHTML = Guided.view();
+  else if (S.view === 'settings') app.innerHTML = await Guided.settingsView();
   afterRender();
   window.scrollTo(0, 0);
 }
 function afterRender() {
   if (S.view === 'session') {
     const k = STEPS[S.session.step].key;
-    if (k === 'dialogue') { bindRecorder('dialogue'); startDialogueClock(); }
+    if (k !== 'done') bindRecorder('dialogue');
+    if (k === 'dialogue') startDialogueClock();
     if (k === 'ground') bindGround();
   }
   if (S.view === 'reflect') bindRecorder('reflection');
   if (S.view === 'detail') { renderClips('dialogue', true); renderClips('reflection', true); }
   if (S.view === 'backup') fillStorage();
+  if (S.view === 'guided') Guided.after();
 }
 
 async function viewHome() {
@@ -338,10 +343,13 @@ async function viewHome() {
     h += `<div class="card"><div class="steplabel">Unfinished session</div><p>${esc(open.image || 'No image chosen yet')} · started ${esc(fmtDate(open.createdAt))} ${esc(fmtTime(open.createdAt))}</p>
       <div class="row"><button class="btn" data-action="resume" data-id="${open.id}">Resume</button><button class="btn ghost" data-action="finish-open" data-id="${open.id}">Save as is</button></div></div>`;
   }
-  h += `<div class="card stack"><button class="btn block" data-action="new">Begin a session</button>`;
+  h += `<div class="card stack">
+    <button class="btn block big" data-action="guided">🎙 Guided session: talk it through</button>
+    <p class="muted small">It asks each question out loud, listens, writes your answers into the template, and asks a follow-up when something’s missing.</p>
+    <button class="btn ghost block" data-action="new">Session on my own (with audio recording)</button>`;
   if (latest && !closed.has(latest.arcId || latest.id)) {
     const n = done.filter((s) => (s.arcId || s.id) === (latest.arcId || latest.id)).length + 1;
-    h += `<button class="btn ghost block" data-action="continue" data-id="${latest.id}">Continue “${esc(latest.image)}” · session ${n}</button>`;
+    h += `<div class="row"><button class="btn quiet" data-action="guided-continue" data-id="${latest.id}">Continue “${esc(latest.image)}” · session ${n} (guided)</button><button class="btn ghost" data-action="continue" data-id="${latest.id}">On my own</button></div>`;
   }
   h += `<p class="muted small">3–4 days a week at your sharpest time, never within 2 hours of sleep. 20 minutes for weeks 1–4, up to 30 after.</p></div>`;
   if (done.length && (!lastBackup || Date.now() - lastBackup > 7 * 864e5)) {
@@ -353,7 +361,7 @@ async function viewHome() {
 
 async function viewStep() {
   const s = S.session, i = s.step, k = STEPS[i].key;
-  let h = progress(i) + `<div class="steplabel">Step ${Math.min(i + 1, 7)} of 7 · ${esc(STEPS[i].label)}</div>`;
+  let h = progress(i) + (k !== 'done' ? recorderBlock('dialogue', 'Audio recording · stays on this device · keeps running across steps') : '') + `<div class="steplabel">Step ${Math.min(i + 1, 7)} of 7 · ${esc(STEPS[i].label)}</div>`;
   const nav = (next = 'Next', back = true, extra = '') => `<div class="navrow">${back ? '<button class="btn ghost" data-action="back">Back</button>' : ''}${extra}<button class="btn" data-action="next">${next}</button></div>`;
   if (k === 'arrive') {
     const anchors = await metaGet('anchors', ['', '', '']);
@@ -404,7 +412,6 @@ async function viewStep() {
   } else if (k === 'dialogue') {
     h += `<h1>Dialogue</h1><p class="muted">${esc(s.image || '')}${s.prompt ? ' · “' + esc(s.prompt) + '”' : ''}</p>
       <div class="timer small-timer" data-dtimer>0:00</div><p class="muted small center" data-dhint>Hold the image. Wait for movement. Step in. Speak and listen. Don’t interpret.</p>
-      ${recorderBlock('dialogue', 'Voice record')}
       <div class="card"><label class="field" for="verb">Verbatim notes (optional)</label>
       <div class="chips mb8"><button class="chip" data-insert="ME: ">ME:</button><button class="chip" data-insert="FIGURE: ">FIGURE:</button><button class="chip" data-insert="[scene] ">[scene]</button><button class="chip" data-insert="[ego steering] ">[ego steering]</button></div>
       <textarea id="verb" class="verbatim" data-field="dialogue" placeholder="ME: …&#10;FIGURE: …">${esc(s.dialogue || '')}</textarea></div>
@@ -480,7 +487,7 @@ async function viewDetail() {
       <ul class="clips" data-clips="reflection"></ul>
       <button class="btn quiet block" data-action="reflect">${r.at ? 'Edit reflection' : 'Add after-reflection'}</button></div>
     <div class="card stack">
-      ${s.status === 'complete' ? `<button class="btn block" data-action="continue" data-id="${s.id}">Continue this image</button>` : `<button class="btn block" data-action="resume" data-id="${s.id}">Resume this session</button>`}
+      ${s.status === 'complete' ? `<button class="btn block" data-action="guided-continue" data-id="${s.id}">Continue this image (guided)</button><button class="btn ghost block" data-action="continue" data-id="${s.id}">Continue this image on my own</button>` : `<button class="btn block" data-action="resume" data-id="${s.id}">Resume this session</button>`}
       <button class="btn ghost block" data-action="arc-toggle" data-arc="${arcId}">${closed.has(arcId) ? 'Reopen this arc' : 'Close this arc'}</button>
       <button class="btn danger block" data-action="delete" data-id="${s.id}">Delete session</button>
     </div>`;
@@ -494,6 +501,7 @@ function viewReflect() {
   return `<button class="linkbtn" data-action="back-detail">← Session</button><h1>After-reflection</h1>
     <p class="muted">${esc(s.image || '')} · ${esc(fmtDate(s.createdAt))}</p>
     ${recent ? '<p class="muted small">The guide suggests at least an hour after the session.</p>' : ''}
+    <button class="btn block" data-action="guided-reflect">🎙 Talk it through (guided)</button>
     ${q.map(([k, l]) => `<label class="field" for="r-${k}">${esc(l)}</label><textarea id="r-${k}" data-field="reflection.${k}">${esc(r[k] || '')}</textarea>`).join('')}
     ${recorderBlock('reflection', 'Voice reflection (optional)')}
     <label class="field" for="r-notes">Other notes</label><textarea id="r-notes" data-field="reflection.notes">${esc(r.notes || '')}</textarea>
@@ -516,7 +524,8 @@ async function viewBackup() {
       <p class="muted small">Restore from a .zip or .json exported here. Sessions you already have are skipped.</p>
       <label class="btn ghost block" for="importFile">Choose backup file</label>
       <input type="file" id="importFile" accept=".zip,.json,application/zip,application/json" class="hidden"></div>
-    <div class="card"><div class="steplabel">Privacy</div><p class="small muted">No account, no server, no analytics, nothing loaded from other sites. This page cannot send your audio anywhere; its security policy only allows it to load its own files.</p></div>`;
+    <div class="card"><div class="steplabel">Privacy</div><p class="small muted">No account, no server, no analytics, nothing loaded from other sites. Audio is never sent anywhere. The only outside connection the page allows is to the AI provider you pick in Settings, and only for the text of guided sessions.</p></div>
+    <div class="card"><div class="steplabel">Updates</div><p class="small muted">Version ${APP_VERSION}. If you don’t see a new feature, close the Home Screen app completely (swipe it away in the app switcher) and open it again.</p></div>`;
 }
 async function fillStorage() {
   const el = $('[data-storage]'); if (!el) return;
@@ -613,8 +622,8 @@ async function newSession(fromId) {
 async function goStep(delta) {
   const s = S.session; const k = STEPS[s.step].key;
   if (delta > 0 && k === 'start' && !(s.image || '').trim()) { toast('Name the image, mood or passage first.'); $('#img') && $('#img').focus(); return; }
-  if (k === 'dialogue') { await stopActiveRecording(); s.dialogueEndedAt = s.dialogueEndedAt || Date.now(); }
-  if (delta > 0 && k === 'after') { s.endedAt = Date.now(); s.status = 'complete'; }
+  if (k === 'dialogue') s.dialogueEndedAt = s.dialogueEndedAt || Date.now();
+  if (delta > 0 && k === 'after') { await stopActiveRecording(); s.endedAt = Date.now(); s.status = 'complete'; }
   s.step = Math.max(0, Math.min(STEPS.length - 1, s.step + delta));
   if (STEPS[s.step].key === 'dialogue') { s.dialogueStartedAt = s.dialogueStartedAt || Date.now(); s.dialogueEndedAt = null; }
   await saveSession(); render();
@@ -646,7 +655,9 @@ function setField(path, value) {
 // ---------- events ----------
 document.addEventListener('click', async (e) => {
   const navBtn = e.target.closest('[data-nav]');
-  if (navBtn) { if (S.view === 'session' || S.view === 'reflect') { await stopActiveRecording(); await saveSession(); } S.view = navBtn.dataset.nav; S.editing = false; render(); return; }
+  if (navBtn) { if (S.view === 'guided') { Guided.leave(); await saveSession(); } if (S.view === 'session' || S.view === 'reflect') { await stopActiveRecording(); await saveSession(); } S.view = navBtn.dataset.nav; S.editing = false; render(); return; }
+  const gt = e.target.closest('[data-g],[data-gv],[data-s],[data-prov]');
+  if (gt && await Guided.onClick(gt)) return;
   const t = e.target.closest('[data-action],[data-v],[data-signal],[data-suggest],[data-prompt],[data-insert]');
   if (!t) return;
   const a = t.dataset.action;
@@ -686,10 +697,15 @@ document.addEventListener('click', async (e) => {
   const phaseOf = () => { const box = t.closest('[data-recorder]'); return box ? box.dataset.recorder : 'dialogue'; };
   switch (a) {
     case 'new': await newSession(); break;
+    case 'guided': await Guided.start('session'); break;
+    case 'guided-continue': await Guided.start('session', t.dataset.id); break;
+    case 'guided-reflect': await stopActiveRecording(); await saveSession(); await Guided.start('reflection'); break;
     case 'continue': await newSession(t.dataset.id); break;
     case 'resume': S.session = await dbGet('sessions', t.dataset.id); S.view = 'session'; render(); break;
     case 'finish-open': { const s = await dbGet('sessions', t.dataset.id); s.status = 'complete'; s.endedAt = s.endedAt || s.updatedAt || Date.now(); await dbPut('sessions', s); toast('Saved.'); render(); break; }
-    case 'cancel': if (confirm('Cancel this session? Nothing has been recorded yet.')) { await deleteSession(S.session.id); S.session = null; S.view = 'home'; render(); } break;
+    case 'cancel':
+      if (confirm('Cancel this session? Anything recorded in it will be deleted.')) { await stopActiveRecording(); await deleteSession(S.session.id); S.session = null; S.view = 'home'; render(); }
+      break;
     case 'next': await goStep(1); break;
     case 'back': await goStep(-1); break;
     case 'gtoggle': S.groundToggle && S.groundToggle(); break;
@@ -759,5 +775,6 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 if (navigator.storage && navigator.storage.persist && (matchMedia('(display-mode: standalone)').matches || navigator.standalone)) navigator.storage.persist().catch(() => {});
+try { const v = sessionStorage.getItem('pj-view'); if (v) { S.view = v; sessionStorage.removeItem('pj-view'); } } catch (e) { /* */ }
 render();
 window.__pj = { dbAll, dbGet, S };
