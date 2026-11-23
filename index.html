@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#14181f" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f1ea" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Practice Journal">
+<title>Active Imagination Practice Journal</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <button class="brand" data-nav="home" aria-label="Home">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-text">Practice Journal</span>
+  </button>
+  <nav class="tabs" aria-label="Main">
+    <button data-nav="home">Today</button>
+    <button data-nav="history">History</button>
+    <button data-nav="backup">Backup</button>
+  </nav>
+</header>
+
+<main id="app" tabindex="-1" aria-live="polite"></main>
+
+<footer class="helpbar">
+  <button id="helpBtn" class="helpbar-btn" aria-haspopup="dialog">Stop signals &amp; help</button>
+  <span class="helpbar-line">Veterans Crisis Line: <a href="tel:988">988, then 1</a> · text <a href="sms:838255">838255</a></span>
+</footer>
+
+<div id="sheet" class="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <h2 id="sheetTitle">Stop signals &amp; help</h2>
+      <button class="icon-btn" id="sheetClose" aria-label="Close">✕</button>
+    </div>
+    <div class="sheet-body">
+      <h3>Stop the session now</h3>
+      <p>Heart racing or panic · the image feels literally real · a combat memory or flashback · numbness, “not here” · an urge to self-harm · the figure demands you act on something in outer life right now.</p>
+      <p class="muted">Open your eyes, do the grounding routine below, close the book. No after-reflection today.</p>
+      <h3>Pause the practice 1–2 weeks</h3>
+      <p>Two nights of worse sleep · more irritability with family or clients · images intruding during the day · more worry, not less · noticeable cognitive fatigue the next day.</p>
+      <p class="muted">Keep ordinary routines; tell your therapist or a trusted person.</p>
+      <h3>Get professional help</h3>
+      <p>Signals persist after a pause · nightmares increase · feeling special, chosen, or on a mission from the material · losing track of time · any suicidal thoughts.</p>
+      <p class="muted">Contact your VA provider or a therapist.</p>
+      <div class="crisis">
+        <strong>Veterans Crisis Line</strong>
+        <div class="crisis-actions">
+          <a class="btn" href="tel:988">Call 988, then press 1</a>
+          <a class="btn ghost" href="sms:838255">Text 838255</a>
+        </div>
+      </div>
+      <h3>Grounding routine (5 minutes)</h3>
+      <ol class="tight">
+        <li>Eyes open. Feet flat on the floor. Press down for 10 seconds.</li>
+        <li>Breathe out longer than in: in 4, out 6, five rounds.</li>
+        <li>5-4-3-2-1: name 5 things you see, 4 you hear, 3 you can touch, 2 you smell, 1 you taste.</li>
+        <li>Orient out loud: today’s day and date, where you are, your name, what you’ll do next.</li>
+        <li>Stand, drink water, walk 2–5 minutes, outside if possible.</li>
+        <li>Close the book. Put the journal and the Red Book away.</li>
+      </ol>
+      <p class="muted small">From section 4 of your guide, “Active Imagination with the Red Book.”</p>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="zip.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
