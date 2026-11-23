@@ -10,7 +10,7 @@ A private, offline-capable web app for a guided active imagination practice: gro
 
 **Guided session (optional AI)**
 - Speaks each template question (speechSynthesis), listens (Web Speech API, with keyboard-dictation fallback), and can use an AI model to turn spoken answers into concise entries, ask follow-ups, and review for gaps before saving.
-- No server of ours: the user pastes their own API key (Anthropic or OpenAI) in Settings. It is stored only in this browser (IndexedDB) and never exported. Requests go directly from the browser to the chosen provider; `csp.js` narrows `connect-src` to that one provider.
+- No server of ours: providers are Anthropic, OpenAI, xAI (Grok), or a local/custom OpenAI-compatible server (e.g. Ollama behind Tailscale Serve, LM Studio). Keys are stored per provider only in this browser (IndexedDB) and never exported. Requests go directly from the browser to the chosen endpoint; `csp.js` narrows `connect-src` to exactly that origin.
 - Only text is sent to the AI. Audio recordings never leave the device.
 
 **Files**: `index.html`, `styles.css`, `app.js`, `zip.js` (minimal stored-zip writer/reader), `guided.js` (guided session, AI providers, settings), `csp.js` (per-provider connect-src), `sw.js` (offline cache), `manifest.webmanifest`, `icons/`.
