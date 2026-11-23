@@ -1,6 +1,6 @@
 /* Offline cache for the app shell. Network first (so updates arrive), cache as fallback offline.
    Only this site's own files are cached; AI requests are never cached. */
-const CACHE = 'pj-v3';
+const CACHE = 'pj-v4';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'zip.js', 'guided.js', 'csp.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-32.png', 'icons/icon-maskable-512.png'];
 self.addEventListener('install', (e) => {

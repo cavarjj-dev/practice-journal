@@ -151,3 +151,5 @@ textarea.short { min-height: 80px; }
 .gapnote { color: var(--warn); font-size: .9rem; margin: 0 0 6px; }
 .recorder { padding: 12px; }
 .recorder .recbtn { width: 96px; height: 96px; }
+
+select.select { width: 100%; min-height: 48px; background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; font-size: 17px; }
