@@ -1,7 +1,7 @@
 /* Active Imagination Practice Journal
    Everything stays on this device: IndexedDB for sessions and audio. No network calls. */
 'use strict';
-const APP_VERSION = '4 (Nov 23, 2026)';
+const APP_VERSION = '5 (Nov 26, 2026)';
 
 // ---------- small helpers ----------
 const $ = (s, r = document) => r.querySelector(s);
