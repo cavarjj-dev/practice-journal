@@ -79,9 +79,12 @@
     return { provider, keys, models, custom, key: keys[provider] || '', model: models[provider] || '' };
   }
   const saveAI = (ai) => metaSet('ai', { provider: ai.provider, keys: ai.keys, models: ai.models, custom: ai.custom });
-  function syncPolicy(ai) { // csp.js reads these on the next load
+  function syncPolicy(ai, voice) { // csp.js reads these on the next load
     let changed = false;
     try {
+      let sttOrigin = localStorage.getItem('pj-stt-origin') || '';
+      if (voice) { const r = resolveStt(ai, voice); const b = sttBackup(ai, voice, r); sttOrigin = r.origin || (b && b.origin) || ''; }
+      if ((localStorage.getItem('pj-stt-origin') || '') !== sttOrigin) { localStorage.setItem('pj-stt-origin', sttOrigin); changed = true; }
       const want = ai.provider; const wantOrigin = ai.provider === 'custom' && ai.custom.base ? baseOrigin(ai.custom.base) : '';
       if ((localStorage.getItem('pj-provider') || 'anthropic') !== want) { localStorage.setItem('pj-provider', want); changed = true; }
       if ((localStorage.getItem('pj-custom-origin') || '') !== wantOrigin) { localStorage.setItem('pj-custom-origin', wantOrigin); changed = changed || want === 'custom'; }
@@ -168,47 +171,137 @@ Reply with JSON only: {"action":"fill"|"followup"|"pause"|"skip","value":<entry>
         const u = new SpeechSynthesisUtterance(text);
         u.rate = G.voice.rate || 1; if (G.voice.lang) u.lang = G.voice.lang;
         u.onend = fin; u.onerror = fin;
-        setTimeout(fin, 2000 + text.length * 85 / (G.voice.rate || 1));
+        setTimeout(fin, 1200 + text.length * 70 / (G.voice.rate || 1)); // iOS sometimes never fires onend
         speechSynthesis.speak(u);
       } catch (e) { fin(); }
     });
   }
   function stopSpeech() { try { window.speechSynthesis && speechSynthesis.cancel(); } catch (e) { /* */ } }
   const SR = () => window.SpeechRecognition || window.webkitSpeechRecognition;
-  function listen(onText) {
-    let rec, resolveFn, rejectFn, finalText = '', interim = '', got = false, silenceT, watchT, settled = false;
+  // Browser live transcription. Must be started from a tap. A fresh recognizer is made every time.
+  const SR_ERRORS = {
+    'not-allowed': 'Speech recognition permission was denied.',
+    'service-not-allowed': 'Speech recognition is turned off for this browser or app (on iPhone it needs Siri/Dictation on, and it isn’t always available in Home Screen apps).',
+    'audio-capture': 'No microphone was available to speech recognition.',
+    'network': 'Speech recognition needs a network connection and couldn’t reach its service.',
+    'no-speech': 'No speech was heard.',
+    'language-not-supported': 'This language isn’t supported by the browser’s speech recognition.',
+  };
+  function listen(onText, onStatus) {
+    let rec, resolveFn, rejectFn, finalText = '', interim = '', got = false, heard = false, silenceT, watchT, settled = false;
     const p = new Promise((res, rej) => { resolveFn = res; rejectFn = rej; });
     const settle = (fn, v) => { if (settled) return; settled = true; clearTimeout(silenceT); clearTimeout(watchT); fn(v); };
+    const fail = (code, msg) => { const e = new Error(msg || SR_ERRORS[code] || ('Speech recognition error: ' + code)); e.code = code; settle(rejectFn, e); try { rec && rec.abort(); } catch (er) { /* */ } };
     const Ctor = SR();
-    if (!Ctor || G.srBroken) { settle(rejectFn, new Error('unsupported')); return { promise: p, stop() {} }; }
+    if (!Ctor) { fail('unsupported', 'This browser has no live speech recognition.'); return { promise: p, stop() {} }; }
     try {
       rec = new Ctor();
-      rec.continuous = true; rec.interimResults = true; rec.lang = G.voice.lang || navigator.language || 'en-US';
+      rec.continuous = true; rec.interimResults = true; rec.maxAlternatives = 1;
+      rec.lang = G.voice.lang || navigator.language || 'en-US';
+      rec.onstart = () => onStatus('Mic on. Start speaking.');
+      rec.onaudiostart = () => onStatus('Mic on. Start speaking.');
+      rec.onsoundstart = () => { heard = true; onStatus('Hearing sound…'); };
+      rec.onspeechstart = () => { heard = true; onStatus('Hearing you…'); };
       rec.onresult = (e) => {
-        got = true; interim = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) { const t = e.results[i][0].transcript; if (e.results[i].isFinal) finalText += t.trim() + ' '; else interim += t; }
+        got = true; heard = true; interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const r = e.results[i]; const t = (r[0] && r[0].transcript) || '';
+          if (r.isFinal) finalText += t.trim() + ' '; else interim += t;
+        }
         onText((finalText + interim).trim());
+        onStatus('Hearing you… tap Done when finished');
         clearTimeout(silenceT);
         if (G.voice.autoSend) silenceT = setTimeout(() => { try { rec.stop(); } catch (er) { /* */ } }, (G.voice.pauseSec || 4) * 1000 * (cur() && cur().type === 'append' ? 1.75 : 1));
       };
       rec.onerror = (e) => {
-        if (e.error === 'aborted') return;
+        if (e.error === 'aborted' && settled) return;
         if (e.error === 'no-speech' && got) return;
-        settle(rejectFn, new Error(e.error === 'not-allowed' || e.error === 'service-not-allowed' ? 'denied' : e.error === 'no-speech' ? 'silent' : e.error || 'error'));
-        try { rec.abort(); } catch (er) { /* */ }
+        fail(e.error || 'error');
       };
-      rec.onend = () => settle(resolveFn, (finalText + interim).trim());
-      watchT = setTimeout(() => { if (!got) { settle(rejectFn, new Error('silent')); try { rec.abort(); } catch (er) { /* */ } } }, 9000);
+      rec.onend = () => { if (!got && !settled) return fail('ended-empty', heard ? 'Speech recognition stopped before it produced any words.' : 'Speech recognition stopped without hearing anything.'); settle(resolveFn, (finalText + interim).trim()); };
+      // Known WebKit bug: the mic opens but no words ever arrive. Give up after 8 s of nothing.
+      watchT = setTimeout(() => { if (!got) fail('silent', 'Live transcription started but heard nothing (a known iPhone/Safari problem).'); }, 8000);
       rec.start();
-    } catch (e) { settle(rejectFn, new Error('unsupported')); }
+    } catch (e) { fail('start-failed', 'Speech recognition couldn’t start: ' + e.message); }
     return { promise: p, stop() { try { rec && rec.stop(); } catch (e) { /* */ } } };
+  }
+
+  // Record & Transcribe: records the answer with MediaRecorder, then sends the clip to a transcription service.
+  function answerRecorder(onStatus) {
+    let stream, mr, chunks = [], startT, tick, maxT, resolveFn, rejectFn, settled = false, cancelled = false;
+    const p = new Promise((res, rej) => { resolveFn = res; rejectFn = rej; });
+    const cleanup = () => { clearInterval(tick); clearTimeout(maxT); if (stream) stream.getTracks().forEach((t) => t.stop()); };
+    (async () => {
+      try {
+        if (!navigator.mediaDevices || !window.MediaRecorder) throw new Error('This browser can’t record audio.');
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        if (cancelled) { cleanup(); return; }
+        const mime = pickMime();
+        mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+        mr.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+        mr.onstop = () => { cleanup(); if (settled) return; settled = true; resolveFn(cancelled ? null : new Blob(chunks, { type: mr.mimeType || mime || 'audio/webm' })); };
+        mr.start(500); startT = Date.now();
+        const show = () => onStatus('● Recording ' + fmtDur(Date.now() - startT) + ' · tap Stop when you’re done');
+        show(); tick = setInterval(show, 500);
+        maxT = setTimeout(() => { try { mr.stop(); } catch (e) { /* */ } }, 5 * 60 * 1000);
+      } catch (e) {
+        cleanup(); if (settled) return; settled = true;
+        rejectFn(new Error(e.name === 'NotAllowedError' ? 'Microphone access was denied.' : e.message || 'Couldn’t start recording.'));
+      }
+    })();
+    return { promise: p, stop() { try { if (mr && mr.state !== 'inactive') mr.stop(); else { cancelled = true; } } catch (e) { /* */ } }, cancel() { cancelled = true; this.stop(); } };
+  }
+  async function transcribe(blob, stt) {
+    const ext = extFor(blob.type); const fd = new FormData(); const lang = (G.voice.lang || navigator.language || 'en').slice(0, 2).toLowerCase();
+    let url;
+    if (stt.kind === 'openai') { url = 'https://api.openai.com/v1/audio/transcriptions'; fd.append('model', 'gpt-4o-mini-transcribe'); fd.append('language', lang); }
+    else if (stt.kind === 'xai') { url = 'https://api.x.ai/v1/stt'; fd.append('model', 'grok-voice-transcribe-2.0'); fd.append('language', lang); fd.append('format', 'true'); }
+    else { url = stt.base + '/audio/transcriptions'; fd.append('model', stt.model || 'whisper-1'); }
+    fd.append('file', blob, 'answer.' + ext); // xAI requires the file last
+    const headers = stt.key ? { authorization: 'Bearer ' + stt.key } : {};
+    const r = await timedFetch(url, { method: 'POST', headers, body: fd }, 120000);
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && (j.error.message || j.error)) || j.message || 'HTTP ' + r.status);
+    return String(j.text || '').trim();
+  }
+  const STT_LABELS = { browser: 'Browser live transcription', openai: 'Record & Transcribe (OpenAI)', xai: 'Record & Transcribe (xAI)', local: 'Record & Transcribe (your server)', keyboard: 'Keyboard dictation' };
+  // Decide how the Talk button turns speech into text on this device.
+  function resolveStt(ai, voice) {
+    const make = (kind, problem) => {
+      const o = { kind, label: STT_LABELS[kind], problem: problem || '' };
+      if (kind === 'openai') Object.assign(o, { key: ai.keys.openai, origin: 'https://api.openai.com' });
+      if (kind === 'xai') Object.assign(o, { key: ai.keys.xai, origin: 'https://api.x.ai' });
+      if (kind === 'local') { o.base = normalizeBase(voice.sttBase); o.model = voice.sttModel || ''; o.key = ai.keys.custom || ''; try { o.origin = baseOrigin(o.base); } catch (e) { return make(SR() ? 'browser' : 'keyboard', e.message); } }
+      return o;
+    };
+    const pick = voice.stt || 'auto';
+    if (pick === 'openai') return ai.keys.openai ? make('openai') : make('keyboard', 'Record & Transcribe (OpenAI) needs an OpenAI key.');
+    if (pick === 'xai') return ai.keys.xai ? make('xai') : make('keyboard', 'Record & Transcribe (xAI) needs an xAI key.');
+    if (pick === 'local') return voice.sttBase ? make('local') : make('keyboard', 'Add your transcription server address.');
+    if (pick === 'browser') return SR() ? make('browser') : make('keyboard', 'This browser has no live speech recognition.');
+    if (pick === 'keyboard') return make('keyboard');
+    if (ai.provider === 'xai' && ai.keys.xai) return make('xai');
+    if (ai.provider === 'openai' && ai.keys.openai) return make('openai');
+    if (ai.provider === 'custom' && voice.sttBase) return make('local'); // keep a self-hosted setup self-hosted
+    if (ai.keys.openai) return make('openai');
+    if (ai.keys.xai) return make('xai');
+    if (voice.sttBase) return make('local');
+    if (SR()) return make('browser');
+    return make('keyboard');
+  }
+  // When live (browser) transcription is in use, the Record & Transcribe option to switch to if it fails.
+  function sttBackup(ai, voice, r) {
+    if (r.kind !== 'browser') return null;
+    let alt = resolveStt(ai, Object.assign({}, voice, { stt: 'auto' }));
+    if (!['openai', 'xai', 'local'].includes(alt.kind) && voice.sttBase) alt = resolveStt(ai, Object.assign({}, voice, { stt: 'local' }));
+    return ['openai', 'xai', 'local'].includes(alt.kind) ? alt : null;
   }
   function stopListening(discard) { if (G.listener) { const l = G.listener; G.listener = null; if (discard) l.discard = true; l.stop(); } }
 
   // ---------- flow ----------
   async function start(mode, fromId) {
     if (S.rec && S.rec.state !== 'idle') { await stopActiveRecording(); toast('Audio recording stopped and saved. Guided mode uses the microphone for talking.'); }
-    G.voice = await getVoice(); { const ai = await getAI(); G.hasKey = configured(ai); G.local = ai.provider === 'custom'; }
+    G.voice = await getVoice(); { const ai = await getAI(); G.hasKey = configured(ai); G.local = ai.provider === 'custom'; G.stt = resolveStt(ai, G.voice); G.sttAlt = sttBackup(ai, G.voice, G.stt); G.srFails = 0; }
     G.mode = mode; G.idx = 0; G.reviewing = false; G.paused = false; G.gaps = []; G.error = ''; G.tip = ''; G.srBroken = false; G.returnToReview = false;
     if (mode === 'session') {
       const s = { id: uid(), status: 'in-progress', guided: true, createdAt: Date.now(), startedAt: Date.now(), step: 0, before: {}, after: {}, clips: [], stopSignals: [], closeChecks: [] };
@@ -238,31 +331,60 @@ Reply with JSON only: {"action":"fill"|"followup"|"pause"|"skip","value":<entry>
     await speak(f.q);
     if (S.view !== 'guided' || cur() !== f || G.paused) return;
     G.state = 'idle'; status();
-    if (f.type !== 'info') startListening();
   }
-  function startListening() {
+  // Called only from a tap on Talk (iOS needs a direct user gesture to open speech recognition or the mic).
+  function startVoice() {
     if (G.listener || G.paused) return;
     stopSpeech();
     const box = $('#gAnswer'); if (!box) return;
+    G.error = ''; errPaint(); G.tip = ''; tipPaint();
+    const stt = G.stt || { kind: 'keyboard' };
+    if (stt.kind === 'keyboard') { keyboardTip(stt.problem); box.focus(); return; }
     G.base = box.value ? box.value.trim() + ' ' : '';
-    const l = listen((t) => { const b = $('#gAnswer'); if (b) b.value = G.base + t; });
-    G.listener = l; G.state = 'listening'; G.tip = ''; status(); tipPaint();
-    l.promise.then((text) => {
-      if (G.listener === l) G.listener = null;
-      G.state = 'idle'; status();
-      if (l.discard) return;
-      const b = $('#gAnswer'); const all = b ? b.value.trim() : text;
-      if (all) submit(all);
-    }).catch((err) => {
-      if (G.listener === l) G.listener = null;
-      G.state = 'idle'; status();
-      if (l.discard) return;
-      if (err.message !== 'error') G.srBroken = true;
-      G.tip = err.message === 'denied'
-        ? 'Speech recognition isn’t allowed. Tap the answer box, then tap the microphone on your keyboard to dictate, and tap Send.'
-        : 'Voice listening isn’t working here. Tap the answer box, then tap the microphone on your keyboard to dictate, and tap Send.';
-      tipPaint();
-    });
+    const live = (t) => { G.live = t; const el = $('[data-gstatus]'); if (el) el.textContent = t; };
+    if (stt.kind === 'browser') {
+      const l = listen((t) => { const b = $('#gAnswer'); if (b) b.value = G.base + t; }, live);
+      l.kind = 'browser'; G.listener = l; G.state = 'listening'; live('Starting live transcription…'); status(true);
+      l.promise.then(() => {
+        if (G.listener === l) G.listener = null;
+        G.state = 'idle'; status();
+        if (l.discard) return;
+        const b = $('#gAnswer'); const all = b ? b.value.trim() : '';
+        if (all && (G.voice.autoSend || l.userDone)) submit(all); else if (all) live('Check your words, then tap Send.');
+      }).catch((err) => {
+        if (G.listener === l) G.listener = null;
+        G.state = 'idle'; status();
+        if (l.discard) return;
+        G.srFails = (G.srFails || 0) + 1;
+        const alt = G.sttAlt;
+        if (alt && (G.srFails >= 1)) { G.stt = alt; G.sttAlt = null; G.tip = err.message + ' Switched to ' + alt.label + ' for this session. Tap Talk again.'; tipPaint(); status(); return; }
+        keyboardTip(err.message + (err.code ? ' (' + err.code + ')' : ''));
+      });
+    } else {
+      const rec = answerRecorder(live);
+      const l = { kind: 'record', stop: () => rec.stop(), promise: rec.promise };
+      G.listener = l; G.state = 'recording'; live('Opening the microphone…'); status(true);
+      rec.promise.then(async (blob) => {
+        if (G.listener === l) G.listener = null;
+        if (l.discard || !blob) { G.state = 'idle'; status(); return; }
+        if (blob.size < 1200) { G.state = 'idle'; status(); live('That was too short to transcribe. Tap Talk and try again.'); return; }
+        G.state = 'transcribing'; status();
+        try {
+          const text = await transcribe(blob, stt);
+          G.state = 'idle'; status();
+          if (!text) { live('No words were recognized. Tap Talk and try again, a little closer to the mic.'); return; }
+          const b = $('#gAnswer'); if (b) b.value = G.base + text;
+          if (G.voice.autoSend) submit(G.base + text); else live('Check your words, then tap Send.');
+        } catch (e) {
+          G.state = 'idle'; status();
+          G.tip = 'Transcription failed: ' + e.message + ' Tap Talk to try again, or type your answer.'; tipPaint();
+        }
+      }).catch((e) => { if (G.listener === l) G.listener = null; G.state = 'idle'; status(); keyboardTip(e.message); });
+    }
+  }
+  function keyboardTip(reason) {
+    G.tip = (reason ? reason + ' ' : '') + 'Tap the answer box, then tap the microphone on your keyboard to dictate, and tap Send.';
+    tipPaint();
   }
   async function submit(text) {
     const f = cur(); if (!f || f.type === 'info') return;
@@ -314,7 +436,6 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     if (act === 'followup' && G.followups < 3) {
       G.followups++; G.say = r.say || 'Can you be more specific?'; G.convo.push({ who: 'Q', text: G.say }); paintSay();
       G.state = 'speaking'; status(); await speak(G.say); G.state = 'idle'; status();
-      if (S.view === 'guided' && cur() === f && !G.paused) startListening();
       return;
     }
     // fill
@@ -332,7 +453,6 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
       const prev = S.session.dialogue ? S.session.dialogue.replace(/\s+$/, '') + '\n' : '';
       S.session.dialogue = prev + String(v || '').trim(); await saveSession();
       G.more = true; G.say = ''; paint();
-      if (S.view === 'guided' && cur() === f && !G.paused) startListening();
       return;
     }
     setField(f.key, f.type === 'scale' ? v : String(v == null ? '' : v).trim());
@@ -429,7 +549,8 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     } else {
       h += `<div class="card talk">
         <button class="talkbtn" data-g="talk" aria-label="Talk">Talk</button>
-        <div class="recstate" data-gstatus></div>
+        <div class="recstate" data-gstatus aria-live="polite"></div>
+        <div class="muted small" data-gmode></div>
         <textarea id="gAnswer" class="answer" placeholder="Your words appear here. You can also type or use the keyboard mic."></textarea>
         <div class="tip hidden" data-gtip></div>
         <div class="err hidden" data-gerr></div>
@@ -469,12 +590,15 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
   }
   function paint() { if (S.view !== 'guided') return; $('#app').innerHTML = viewGuided(); afterGuided(); }
   function paintSay() { const el = $('[data-gsay]'); if (el) el.textContent = G.say; }
-  function status() {
+  function status(keepText) {
     const el = $('[data-gstatus]'); const b = $('.talkbtn');
     if (!el) return;
-    const map = { listening: '● Listening… pause or tap Talk to finish', thinking: G.local ? 'Writing it up… (a local model can take up to a minute the first time)' : 'Writing it up…', speaking: 'Speaking…', idle: G.srBroken ? 'Type or use the keyboard mic, then tap Send.' : 'Tap Talk to answer.' };
-    el.textContent = map[G.state] || '';
-    if (b) { b.classList.toggle('recording', G.state === 'listening'); b.textContent = G.state === 'listening' ? 'Done' : 'Talk'; b.disabled = G.state === 'thinking'; }
+    const kb = !G.stt || G.stt.kind === 'keyboard';
+    const map = { thinking: G.local ? 'Writing it up… (a local model can take up to a minute the first time)' : 'Writing it up…', transcribing: 'Transcribing…', speaking: 'Speaking… tap Talk to answer now', idle: kb ? 'Type your answer or use the keyboard mic, then tap Send.' : 'Tap Talk to answer.' };
+    if (!keepText && map[G.state] !== undefined) el.textContent = map[G.state];
+    const busy = G.state === 'listening' || G.state === 'recording';
+    if (b) { b.classList.toggle('recording', busy); b.textContent = G.state === 'recording' ? 'Stop' : G.state === 'listening' ? 'Done' : kb ? 'Type' : 'Talk'; b.disabled = G.state === 'thinking' || G.state === 'transcribing'; }
+    const m = $('[data-gmode]'); if (m && G.stt) m.textContent = 'Voice input: ' + G.stt.label + (G.stt.problem ? ' · ' + G.stt.problem : '');
   }
   function tipPaint() { const el = $('[data-gtip]'); if (el) { el.textContent = G.tip; el.classList.toggle('hidden', !G.tip); } }
   function errPaint() {
@@ -486,7 +610,6 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
   // ---------- settings ----------
   async function viewSettings() {
     const ai = await getAI(); const v = await getVoice(); const p = PROVIDERS[ai.provider] || PROVIDERS.anthropic;
-    const srOk = !!SR();
     return `<h1>Settings</h1>
     <div class="card"><div class="steplabel">AI for guided sessions</div>
       <label class="field" for="aiProv">Provider</label>
@@ -508,7 +631,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     <div class="card"><div class="steplabel">Privacy</div>
       <ul class="tight small">
         <li><strong>What goes to the AI:</strong> the text of what you say or type in a guided session, the question you’re on, and the entries so far. It goes straight from this device to ${esc(p.name)} using your key. No server of ours is involved.</li>
-        <li><strong>What never leaves:</strong> audio recordings, your history, and your backups stay on this device.</li>
+        <li><strong>What never leaves:</strong> your session recordings, history and backups stay on this device. Only if you use Record &amp; Transcribe is each short spoken answer sent to the transcription service you chose, then discarded by this app.</li>
         <li><strong>Speech-to-text:</strong> on iPhone, listening uses Apple’s speech recognition, which may process audio on the device or on Apple’s servers. Keyboard dictation works the same way.</li>
         <li><strong>Your key</strong> is stored only in this browser on this device and is not included in exports. Anyone with this unlocked phone could use it, so set a spending limit with the provider.</li>
         <li>The provider’s own API data policy applies. Check it in their console; OpenAI and Anthropic say API data isn’t used for training by default.</li>
@@ -522,7 +645,19 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
       <input type="number" id="pauseSec" min="2" max="15" value="${v.pauseSec}" data-voicenum="pauseSec">
       <label class="field" for="rate">Speaking speed</label>
       <input type="number" id="rate" min="0.6" max="1.6" step="0.1" value="${v.rate}" data-voicenum="rate">
-      <p class="muted small">Listening in this browser: ${srOk ? 'available. If it stops responding on iPhone, the app switches to the keyboard microphone.' : 'not available. Use the microphone on your keyboard to dictate into the answer box.'}</p>
+    </div>
+    <div class="card"><div class="steplabel">Voice input (Talk button)</div>
+      ${(() => { const r = resolveStt(ai, v); const pick = v.stt || 'auto'; const opt = (val, label) => `<option value="${val}" ${pick === val ? 'selected' : ''}>${label}</option>`;
+        return `<select id="sttSel" class="select">${opt('auto', 'Automatic (recommended)')}${opt('browser', 'Browser live transcription')}${opt('openai', 'Record &amp; Transcribe with OpenAI')}${opt('xai', 'Record &amp; Transcribe with xAI (Grok)')}${opt('local', 'Record &amp; Transcribe with my server')}${opt('keyboard', 'Keyboard dictation only')}</select>
+        <p class="small mt8">On this device the Talk button uses: <strong data-sttnow>${esc(r.label)}</strong>${r.problem ? ` <span class="warnline">(${esc(r.problem)})</span>` : ''}</p>
+        ${(pick === 'openai' && !ai.keys.openai) || (pick === 'xai' && !ai.keys.xai) ? `<label class="field" for="sttKey">${pick === 'openai' ? 'OpenAI' : 'xAI'} key for transcription</label><input type="password" id="sttKey" placeholder="Paste key" autocomplete="off" autocapitalize="off" spellcheck="false"><div class="row mt8"><button class="btn quiet" data-s="save-sttkey" data-prov2="${pick}">Save key</button></div>` : ''}
+        ${pick === 'local' ? `<label class="field" for="sttBase">Transcription server URL</label><input type="url" id="sttBase" value="${esc(v.sttBase || '')}" placeholder="https://your-pc.your-tailnet.ts.net" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <label class="field" for="sttModel">Transcription model</label><input type="text" id="sttModel" value="${esc(v.sttModel || '')}" placeholder="whisper-1 (or your server’s model name)" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <p class="muted small">Any OpenAI-compatible <code>/v1/audio/transcriptions</code> server (for example Speaches / faster-whisper-server) behind https, allowing this site in CORS. Ollama itself doesn’t transcribe audio.</p>
+          <div class="row mt8"><button class="btn quiet" data-s="save-stt">Save</button></div>` : ''}
+        <p class="muted small">Record &amp; Transcribe records your answer, then sends that short clip to the service you chose to turn it into text (about $0.003 per minute with OpenAI, less with xAI). The clip isn’t kept. Browser live transcription uses Apple’s or Google’s speech service. Keyboard dictation always works: tap the answer box, then the keyboard’s mic.</p>`; })()}
+      <div class="row"><button class="btn ghost" data-s="test-voice">Test mic &amp; transcription</button></div>
+      <div class="small" data-voicetest></div>
     </div>
     <div class="card"><div class="steplabel">About</div><p class="small muted">Version ${APP_VERSION}. If you don’t see a new feature, close the Home Screen app completely (swipe it away in the app switcher) and open it again.</p></div>`;
   }
@@ -530,8 +665,59 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     const sel = $('#aiModelSel'); if (!sel) return '';
     return sel.value === '__custom' ? $('#aiModel').value.trim() : sel.value;
   }
-  async function settingsClick(a) {
+  function deviceDesc() {
+    const ua = navigator.userAgent; const ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    const browser = /Firefox|FxiOS/.test(ua) ? 'Firefox' : /Edg\//.test(ua) ? 'Edge' : navigator.brave ? 'Brave' : /CriOS|Chrome/.test(ua) ? 'Chrome' : /Safari/.test(ua) ? 'Safari' : 'this browser';
+    return (ios ? (standalone ? 'iPhone/iPad Home Screen app' : 'iPhone/iPad ' + browser) : browser + (standalone ? ' (installed app)' : ''));
+  }
+  async function testVoice() {
+    const out = $('[data-voicetest]'); const lines = [];
+    const show = (extra) => { out.innerHTML = `<ul class="tight">${lines.map((l) => `<li>${l}</li>`).join('')}</ul>${extra || ''}`; };
+    const ai = await getAI(); const v = await getVoice(); G.voice = v; const r = resolveStt(ai, v);
+    lines.push('Device: ' + esc(deviceDesc()) + (window.isSecureContext ? '' : ' · ❌ not a secure (https) page, so the mic is blocked'));
+    let blob = null;
+    show('<p><strong>Recording 3 seconds… say “testing one two three”.</strong></p>');
+    try { const rec = answerRecorder(() => {}); setTimeout(() => rec.stop(), 3500); blob = await rec.promise; lines.push(`✅ Microphone works (${fmtSize(blob ? blob.size : 0)} recorded).`); }
+    catch (e) { lines.push('❌ Microphone: ' + esc(e.message) + ' On iPhone: Settings › Apps › Safari › Microphone › Allow, then reopen the app.'); }
+    let rt = ['openai', 'xai', 'local'].includes(r.kind) ? r : resolveStt(ai, Object.assign({}, v, { stt: 'auto' }));
+    if (!['openai', 'xai', 'local'].includes(rt.kind)) rt = null;
+    if (blob && rt) {
+      show(`<p>Transcribing with ${esc(rt.label)}…</p>`);
+      try { const t = await transcribe(blob, rt); lines.push(t ? `✅ ${esc(rt.label)} works. Heard: “${esc(t)}”` : `⚠️ ${esc(rt.label)} answered but heard no words. Try again closer to the mic.`); }
+      catch (e) { lines.push(`❌ ${esc(rt.label)}: ${esc(e.message)}${r.kind !== rt.kind ? ' (select it above and Save first so the page is allowed to reach it)' : ''}`); }
+    } else if (!rt) lines.push('ℹ️ Record &amp; Transcribe isn’t set up yet: it needs an OpenAI or xAI key, or your own transcription server.');
+    lines.push(SR() ? 'ℹ️ This browser offers live transcription. Tap the button below and speak to test it.' : 'ℹ️ This browser has no live transcription (normal for Firefox, and often for the iPhone Home Screen app).');
+    lines.push(`➡️ The Talk button will use: <strong>${esc(r.label)}</strong>${r.kind === 'keyboard' ? '. Tap the answer box, then the microphone on your keyboard.' : '.'}`);
+    show(SR() ? '<div class="row mt8"><button class="btn quiet" data-s="test-sr">Test live transcription (tap, then speak)</button></div><p class="small" data-srtest></p>' : '');
+  }
+  function testSR() { // runs straight from the tap, like the Talk button
+    const el = $('[data-srtest]'); stopSpeech();
+    const l = listen((t) => { el.textContent = 'Heard: “' + t + '”'; }, (m) => { if (!/Heard/.test(el.textContent)) el.textContent = m; });
+    el.textContent = 'Starting…';
+    const t = setTimeout(() => l.stop(), 8000);
+    l.promise.then((txt) => { clearTimeout(t); el.textContent = txt ? '✅ Live transcription works. Heard: “' + txt + '”' : '⚠️ Live transcription heard nothing.'; })
+      .catch((e) => { clearTimeout(t); el.textContent = '❌ Live transcription: ' + e.message + (e.code ? ' (' + e.code + ')' : ''); });
+  }
+  async function saveVoiceAndSync(patch) {
+    const v = Object.assign(await getVoice(), patch); await metaSet('voice', v); G.voice = v;
+    if (syncPolicy(await getAI(), v)) return reloadToSettings();
+    render();
+  }
+  async function settingsClick(a, t) {
     const st = $('[data-aistatus]');
+    if (a === 'test-voice') return testVoice();
+    if (a === 'test-sr') return testSR();
+    if (a === 'save-stt') {
+      const base = normalizeBase($('#sttBase').value); if (base) { try { baseOrigin(base); } catch (e) { $('[data-voicetest]').textContent = e.message; return; } }
+      return saveVoiceAndSync({ sttBase: base, sttModel: $('#sttModel').value.trim() });
+    }
+    if (a === 'save-sttkey') {
+      const key = $('#sttKey').value.trim(); if (!key) return;
+      const ai = await getAI(); ai.keys[t.dataset.prov2] = key; await saveAI(ai);
+      if (syncPolicy(ai, await getVoice())) return reloadToSettings();
+      toast('Saved on this device.'); return render();
+    }
     if (a === 'load-models') {
       const ai = await getAI(); const base = normalizeBase($('#aiBase').value);
       if (base !== ai.custom.base) { st.textContent = 'Tap Save first to apply the new server address, then Load models.'; return; }
@@ -554,7 +740,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
       ai.models[ai.provider] = chosenModel(); if (key) ai.keys[ai.provider] = key;
       if (ai.provider === 'custom') { const base = normalizeBase($('#aiBase').value); if (base) { try { baseOrigin(base); } catch (e) { st.textContent = e.message; return; } } ai.custom.base = base; }
       await saveAI(ai); toast('Saved on this device.');
-      if (syncPolicy(ai)) return reloadToSettings();
+      if (syncPolicy(ai, await getVoice())) return reloadToSettings();
       render();
     } else if (a === 'clear-ai') {
       if (confirm('Remove the ' + PROVIDERS[(await getAI()).provider].name + ' key from this device?')) { const ai = await getAI(); delete ai.keys[ai.provider]; await saveAI(ai); render(); }
@@ -571,8 +757,8 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
 
   // ---------- events ----------
   async function onClick(t) {
-    if (t.dataset.prov) { const ai = await getAI(); if (ai.provider !== t.dataset.prov) { ai.provider = t.dataset.prov; await saveAI(ai); syncPolicy(ai); reloadToSettings(); } return true; }
-    if (t.dataset.s) { await settingsClick(t.dataset.s); return true; }
+    if (t.dataset.prov) { const ai = await getAI(); if (ai.provider !== t.dataset.prov) { ai.provider = t.dataset.prov; await saveAI(ai); syncPolicy(ai, await getVoice()); reloadToSettings(); } return true; }
+    if (t.dataset.s) { await settingsClick(t.dataset.s, t); return true; }
     if (t.dataset.gv) {
       const grp = t.closest('[data-gscale]'); const v = +t.dataset.gv;
       $$('button', grp).forEach((b) => b.setAttribute('aria-pressed', String(b === t)));
@@ -585,7 +771,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
     }
     const g = t.dataset.g; if (!g) return false;
     switch (g) {
-      case 'talk': if (G.listener) G.listener.stop(); else { G.more = false; startListening(); } break;
+      case 'talk': if (G.listener) { G.listener.userDone = true; G.listener.stop(); } else { G.more = false; startVoice(); } break;
       case 'send': { const b = $('#gAnswer'); const txt = b ? b.value : ''; if (G.listener) { stopListening(true); } if (txt.trim()) submit(txt); else if (cur().optional) next(); else toast('Say or type an answer, or tap Skip.'); break; }
       case 'skip': next(); break;
       case 'next': next(); break;
@@ -612,6 +798,7 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
   });
   document.addEventListener('change', async (e) => {
     const el = e.target;
+    if (el.id === 'sttSel') { await saveVoiceAndSync({ stt: el.value }); return; }
     if (el.id === 'aiModelSel') { $('#aiModel').classList.toggle('hidden', el.value !== '__custom'); if (el.value === '__custom') $('#aiModel').focus(); }
     if (el.dataset.voice) { const v = await getVoice(); v[el.dataset.voice] = el.checked; await metaSet('voice', v); G.voice = v; }
     if (el.dataset.voicenum) { const v = await getVoice(); const n = parseFloat(el.value); if (n > 0) { v[el.dataset.voicenum] = n; await metaSet('voice', v); G.voice = v; } }
@@ -619,6 +806,6 @@ ${G.convo.map((c) => (c.who === 'Julian' ? 'JULIAN: ' : 'Q: ') + c.text).join('\
   function leave() { stopListening(true); stopSpeech(); }
 
   // Keep the connection policy (csp.js reads localStorage) in step with the saved provider.
-  getAI().then((ai) => { if (syncPolicy(ai)) location.reload(); }).catch(() => {});
+  Promise.all([getAI(), getVoice()]).then(([ai, v]) => { if (syncPolicy(ai, v)) location.reload(); }).catch(() => {});
   window.Guided = { start, view: viewGuided, after: afterGuided, settingsView: viewSettings, onClick, leave, PROVIDERS, _G: G };
 })();
