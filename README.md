@@ -9,7 +9,7 @@ A private, offline-capable web app for a guided active imagination practice: gro
 - Clearing the browser's website data deletes the journal. Back up regularly.
 
 **Guided session (optional AI)**
-- Speaks each template question (speechSynthesis), listens (Web Speech API, with keyboard-dictation fallback), and can use an AI model to turn spoken answers into concise entries, ask follow-ups, and review for gaps before saving.
+- Speaks each template question (speechSynthesis). Tap **Talk** to answer: live browser transcription (Web Speech API), or **Record & Transcribe** (records the answer, then sends just that clip to OpenAI `gpt-4o-mini-transcribe`, xAI `/v1/stt`, or your own OpenAI-compatible `/audio/transcriptions` server), with keyboard dictation as the fallback. Settings › Voice input chooses the method and has a **Test mic & transcription** button. It can also use an AI model to turn spoken answers into concise entries, ask follow-ups, and review for gaps before saving.
 - No server of ours: providers are Anthropic, OpenAI, xAI (Grok), or a local/custom OpenAI-compatible server (e.g. Ollama behind Tailscale Serve, LM Studio). Keys are stored per provider only in this browser (IndexedDB) and never exported. Requests go directly from the browser to the chosen endpoint; `csp.js` narrows `connect-src` to exactly that origin.
 - Only text is sent to the AI. Audio recordings never leave the device.
 
